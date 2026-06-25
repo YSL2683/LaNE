@@ -6,7 +6,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--path")
 args = parser.parse_args()
 
-payload = torch.load(args.path)
+print(args.path)
+payload = torch.load(args.path, weights_only=False)
 demo = payload[0]
 
 obs_list = [[], []]

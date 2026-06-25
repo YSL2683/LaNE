@@ -522,8 +522,8 @@ class RadSacAgent(object):
         torch.save(self.critic.state_dict(), "%s/critic_%s.pt" % (model_dir, step))
 
     def load(self, model_dir, step):
-        self.actor.load_state_dict(torch.load("%s/actor_%s.pt" % (model_dir, step)))
-        self.critic.load_state_dict(torch.load("%s/critic_%s.pt" % (model_dir, step)))
+        self.actor.load_state_dict(torch.load("%s/actor_%s.pt" % (model_dir, step), weights_only=False))
+        self.critic.load_state_dict(torch.load("%s/critic_%s.pt" % (model_dir, step), weights_only=False))
 
 
 class E2CSacAgent(RadSacAgent):

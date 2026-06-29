@@ -232,8 +232,10 @@ class RadSacAgent(object):
         pretrain_mode=None,
         conv_layer_norm=False,
         p_reward=1,
+        reward_camera="both",
     ):
         self.device = device
+        self.reward_camera = reward_camera
         self.discount = discount
         self.critic_tau = critic_tau
         self.encoder_tau = encoder_tau
@@ -536,10 +538,17 @@ class E2CSacAgent(RadSacAgent):
                 obs_non_crop,
                 next_obs_non_crop,
             ) = replay_buffer.sample_e2c()
+
+            if self.reward_camera == "wrist":
+                obs = obs[:, 3:]
+                next_obs = next_obs[:, 3:]
+                obs_non_crop = obs_non_crop[:, 3:]
+                next_obs_non_crop = next_obs_non_crop[:, 3:]
+
             dkl, mse, ref_kl, predict = self.e2c(
                 obs, action, next_obs, obs_non_crop, next_obs_non_crop
             )
-            loss = dkl + mse * 128 * 128 * 6 + ref_kl
+            loss = dkl + mse * 128 * 128 * obs.shape[1] + ref_kl
 
             self.e2c_optimizer.zero_grad()
             loss.backward()
@@ -616,11 +625,14 @@ class E2CSacAgent(RadSacAgent):
         if self.e2c is None:
             from e2c import E2C
 
+            in_channels = 3 if self.reward_camera == "wrist" else 6
+            crop_shape = (in_channels, self.obs_shape[1], self.obs_shape[2])
+
             self.e2c = E2C(
-                obs_shape=(6, 128, 128),
+                obs_shape=(in_channels, 128, 128),
                 action_dim=self.action_shape[0],
                 z_dimension=16,
-                crop_shape=self.obs_shape,
+                crop_shape=crop_shape,
             ).to(self.device)
             self.e2c_optimizer = torch.optim.Adam(self.e2c.parameters(), lr=1e-4)
 
@@ -637,6 +649,8 @@ class E2CSacAgent(RadSacAgent):
                     torch.as_tensor(demo_next_obs, device=replay_buffer.device).float()
                     / 255
                 )
+                if self.reward_camera == "wrist":
+                    demo_next_obs = demo_next_obs[:, 3:]
                 z_demo = (
                     self.e2c.enc(demo_next_obs)[0].unsqueeze(0).detach().cpu().numpy()
                 )
@@ -652,7 +666,8 @@ class E2CSacAgent(RadSacAgent):
         )
 
         if self.p_reward != 0:
-            z_pred = self.e2c.enc(next_obs)[0].unsqueeze(1).detach().cpu().numpy()
+            next_obs_enc = next_obs[:, 3:] if self.reward_camera == "wrist" else next_obs
+            z_pred = self.e2c.enc(next_obs_enc)[0].unsqueeze(1).detach().cpu().numpy()
 
             min_dist = np.ones(len(next_obs)) * 10000
             discount_power = np.zeros(len(next_obs))
@@ -714,7 +729,7 @@ class DINOE2CSacAgent(RadSacAgent):
             dkl, mse, ref_kl, predict = self.e2c(
                 dino_obs, action, dino_next_obs, None, None
             )
-            loss = dkl + mse * 768 + ref_kl
+            loss = dkl + mse * (384 if self.reward_camera == "wrist" else 768) + ref_kl
 
             self.e2c_optimizer.zero_grad()
             loss.backward()
@@ -746,16 +761,19 @@ class DINOE2CSacAgent(RadSacAgent):
     def dino_embed(self, obs):
         with torch.no_grad():
             image1, image2 = torch.split(obs, [3, 3], dim=1)
-            dino_emb1 = self.dino(image1)
             dino_emb2 = self.dino(image2)
+            if self.reward_camera == "wrist":
+                return dino_emb2
+            dino_emb1 = self.dino(image1)
         return torch.cat([dino_emb1, dino_emb2], dim=1)
 
     def update(self, replay_buffer, L, step, demo_density=None):
         if self.e2c is None:
             from e2c import MLPE2C
 
+            in_dim = 384 if self.reward_camera == "wrist" else 768
             self.e2c = MLPE2C(
-                obs_shape=(768,),
+                obs_shape=(in_dim,),
                 action_dim=self.action_shape[0],
                 z_dimension=16,
                 crop_shape=None,

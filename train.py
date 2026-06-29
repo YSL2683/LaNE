@@ -96,6 +96,7 @@ def parse_args():
     parser.add_argument("--pretrain_mode", default=None, type=str)
     parser.add_argument("--conv_layer_norm", default=False, action="store_true")
     parser.add_argument("--p_reward", default=1, type=float)
+    parser.add_argument("--reward_camera", default="both", type=str, choices=["both", "wrist"])
 
     args = parser.parse_args()
     return args
@@ -226,6 +227,7 @@ def make_agent(obs_shape, action_shape, args, device):
         conv_layer_norm=args.conv_layer_norm,
         data_augs=args.data_augs,
         p_reward=args.p_reward,
+        reward_camera=args.reward_camera,
     )
 
 

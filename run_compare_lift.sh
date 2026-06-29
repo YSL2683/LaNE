@@ -13,11 +13,11 @@ COMMON_ARGS="--domain_name robosuite_lift \
   --v_clip_low -100 --v_clip_high 100 --seed 1 --num_eval_episodes 20 --encoder_feature_dim 32 \
   --final_demo_density 0.15"
 
-echo "=== [1/2] 기존 방식(both) 실험 시작 ==="
-python train.py $COMMON_ARGS --work_dir ./data/robosuite_lift/lane_dino_both --reward_camera both
-
-echo "=== [2/2] 손목 카메라(wrist) 전용 실험 시작 ==="
+echo "=== [1/2] 손목 카메라(wrist) 전용 실험 시작 ==="
 # GPU 자원 경합 및 연산 비결정성 문제 방지를 위해 순차 실행합니다.
 python train.py $COMMON_ARGS --work_dir ./data/robosuite_lift/lane_dino_wrist --reward_camera wrist
+
+echo "=== [2/2] 기존 방식(both) 실험 시작 ==="
+python train.py $COMMON_ARGS --work_dir ./data/robosuite_lift/lane_dino_both --reward_camera both
 
 echo "모든 실험이 완료되었습니다. tensorboard --logdir ./data/robosuite_lift 로 결과를 확인하세요."

@@ -715,6 +715,15 @@ class E2CSacAgent(RadSacAgent):
 
 
 class DINOE2CSacAgent(RadSacAgent):
+    def dino_embed(self, obs):
+        with torch.no_grad():
+            image1, image2 = torch.split(obs, [3, 3], dim=1)
+            dino_emb2 = self.dino(image2)
+            if self.reward_camera == "wrist":
+                return dino_emb2
+            dino_emb1 = self.dino(image1)
+        return torch.cat([dino_emb1, dino_emb2], dim=1)
+
     def update_e2c(self, replay_buffer, L, step, num_updates, init=False, mse_tol=None):
         for i in range(num_updates):
             (
@@ -724,16 +733,39 @@ class DINOE2CSacAgent(RadSacAgent):
                 obs_non_crop,
                 next_obs_non_crop,
             ) = replay_buffer.sample_e2c()
+            
             dino_obs = self.dino_embed(obs)
             dino_next_obs = self.dino_embed(next_obs)
-            dkl, mse, ref_kl, predict = self.e2c(
-                dino_obs, action, dino_next_obs, None, None
-            )
-            loss = dkl + mse * (384 if self.reward_camera == "wrist" else 768) + ref_kl
+            
+            if self.reward_camera == "decouple":
+                dino_obs_f, dino_obs_w = torch.split(dino_obs, [384, 384], dim=1)
+                dino_next_obs_f, dino_next_obs_w = torch.split(dino_next_obs, [384, 384], dim=1)
+                
+                dkl_f, mse_f, ref_kl_f, _ = self.e2c_front(dino_obs_f, action, dino_next_obs_f, None, None)
+                dkl_w, mse_w, ref_kl_w, _ = self.e2c_wrist(dino_obs_w, action, dino_next_obs_w, None, None)
+                
+                loss_f = dkl_f + mse_f * 384 + ref_kl_f
+                loss_w = dkl_w + mse_w * 384 + ref_kl_w
+                loss = loss_f + loss_w
+                
+                dkl = (dkl_f + dkl_w) / 2
+                mse = (mse_f + mse_w) / 2
+                ref_kl = (ref_kl_f + ref_kl_w) / 2
+                
+                self.e2c_front_optimizer.zero_grad()
+                self.e2c_wrist_optimizer.zero_grad()
+                loss.backward()
+                self.e2c_front_optimizer.step()
+                self.e2c_wrist_optimizer.step()
+            else:
+                dkl, mse, ref_kl, predict = self.e2c(
+                    dino_obs, action, dino_next_obs, None, None
+                )
+                loss = dkl + mse * (384 if self.reward_camera == "wrist" else 768) + ref_kl
 
-            self.e2c_optimizer.zero_grad()
-            loss.backward()
-            self.e2c_optimizer.step()
+                self.e2c_optimizer.zero_grad()
+                loss.backward()
+                self.e2c_optimizer.step()
 
             if init:
                 folder = "train_e2c_init/"
@@ -742,9 +774,6 @@ class DINOE2CSacAgent(RadSacAgent):
                     L._sw.add_scalar(folder + "mse", mse, i)
                     L._sw.add_scalar(folder + "ref_kl", ref_kl, i)
                     L._sw.add_scalar(folder + "loss", loss, i)
-
-                if i % 100 == 0:
-                    print(f"E2C loss: {loss}")
 
             if mse_tol is not None and mse.detach().cpu().item() < mse_tol:
                 break
@@ -758,34 +787,39 @@ class DINOE2CSacAgent(RadSacAgent):
                 L._sw.add_scalar(folder + "ref_kl", ref_kl, step)
                 L._sw.add_scalar(folder + "loss", loss, step)
 
-    def dino_embed(self, obs):
-        with torch.no_grad():
-            image1, image2 = torch.split(obs, [3, 3], dim=1)
-            dino_emb2 = self.dino(image2)
-            if self.reward_camera == "wrist":
-                return dino_emb2
-            dino_emb1 = self.dino(image1)
-        return torch.cat([dino_emb1, dino_emb2], dim=1)
-
     def update(self, replay_buffer, L, step, demo_density=None):
-        if self.e2c is None:
+        if getattr(self, 'e2c_initialized', False) is False:
             from e2c import MLPE2C
 
-            in_dim = 384 if self.reward_camera == "wrist" else 768
-            self.e2c = MLPE2C(
-                obs_shape=(in_dim,),
-                action_dim=self.action_shape[0],
-                z_dimension=16,
-                crop_shape=None,
-            ).to(self.device)
             self.dino = torch.hub.load(
                 "facebookresearch/dinov2", "dinov2_vits14_reg"
             ).to(self.device)
-            self.e2c_optimizer = torch.optim.Adam(self.e2c.parameters(), lr=1e-4)
+            
+            if self.reward_camera == "decouple":
+                self.e2c_front = MLPE2C(
+                    obs_shape=(384,), action_dim=self.action_shape[0], z_dimension=16, crop_shape=None
+                ).to(self.device)
+                self.e2c_wrist = MLPE2C(
+                    obs_shape=(384,), action_dim=self.action_shape[0], z_dimension=16, crop_shape=None
+                ).to(self.device)
+                self.e2c_front_optimizer = torch.optim.Adam(self.e2c_front.parameters(), lr=1e-4)
+                self.e2c_wrist_optimizer = torch.optim.Adam(self.e2c_wrist.parameters(), lr=1e-4)
+                self.z_demo_front_cache = {}
+                self.z_demo_wrist_cache = {}
+            else:
+                in_dim = 384 if self.reward_camera == "wrist" else 768
+                self.e2c = MLPE2C(
+                    obs_shape=(in_dim,), action_dim=self.action_shape[0], z_dimension=16, crop_shape=None
+                ).to(self.device)
+                self.e2c_optimizer = torch.optim.Adam(self.e2c.parameters(), lr=1e-4)
+
+            self.e2c_initialized = True
 
         if step % 300 == 0 and self.p_reward != 0:
             self.update_e2c(replay_buffer, L, step, 1000, mse_tol=0.2)
 
+            one_step_dist_list_front = []
+            one_step_dist_list_wrist = []
             one_step_dist_list = []
 
             for i in range(len(replay_buffer.demo_starts)):
@@ -797,76 +831,142 @@ class DINOE2CSacAgent(RadSacAgent):
                     / 255
                 )
                 dino_demo_next_obs = self.dino_embed(demo_next_obs)
-                z_demo = (
-                    self.e2c.enc(dino_demo_next_obs)[0]
-                    .unsqueeze(0)
-                    .detach()
-                    .cpu()
-                    .numpy()
-                )
-                self.z_demo_cache[i] = z_demo
-                one_step_dist_list.append(
-                    ((z_demo[0, 1:] - z_demo[0, :-1]) ** 2).sum(axis=1).mean()
-                )
+                
+                if self.reward_camera == "decouple":
+                    dino_obs_f, dino_obs_w = torch.split(dino_demo_next_obs, [384, 384], dim=1)
+                    z_demo_f = self.e2c_front.enc(dino_obs_f)[0].unsqueeze(0).detach().cpu().numpy()
+                    z_demo_w = self.e2c_wrist.enc(dino_obs_w)[0].unsqueeze(0).detach().cpu().numpy()
+                    self.z_demo_front_cache[i] = z_demo_f
+                    self.z_demo_wrist_cache[i] = z_demo_w
+                    one_step_dist_list_front.append(((z_demo_f[0, 1:] - z_demo_f[0, :-1]) ** 2).sum(axis=1).mean())
+                    one_step_dist_list_wrist.append(((z_demo_w[0, 1:] - z_demo_w[0, :-1]) ** 2).sum(axis=1).mean())
+                else:
+                    z_demo = self.e2c.enc(dino_demo_next_obs)[0].unsqueeze(0).detach().cpu().numpy()
+                    self.z_demo_cache[i] = z_demo
+                    one_step_dist_list.append(((z_demo[0, 1:] - z_demo[0, :-1]) ** 2).sum(axis=1).mean())
 
-            self.ref_one_step_dist = np.mean(one_step_dist_list)
+            if self.reward_camera == "decouple":
+                self.ref_one_step_dist_front = np.mean(one_step_dist_list_front)
+                self.ref_one_step_dist_wrist = np.mean(one_step_dist_list_wrist)
+            else:
+                self.ref_one_step_dist = np.mean(one_step_dist_list)
 
-        if self.encoder_type == "pixel":
-            obs, action, reward, next_obs, not_done = replay_buffer.sample_rad(
-                self.augs_funcs, demo_density=demo_density
-            )
-        else:
-            obs, action, reward, next_obs, not_done = replay_buffer.sample_rad(
-                self.augs_funcs, demo_density=demo_density
-            )
+        obs, action, reward, next_obs, not_done = replay_buffer.sample_rad(
+            self.augs_funcs, demo_density=demo_density
+        )
 
         if self.p_reward != 0:
             dino_next_obs = self.dino_embed(next_obs)
-            z_pred = self.e2c.enc(dino_next_obs)[0].unsqueeze(1).detach().cpu().numpy()
+            
+            if self.reward_camera == "decouple":
+                dino_obs_f, dino_obs_w = torch.split(dino_next_obs, [384, 384], dim=1)
+                z_pred_f = self.e2c_front.enc(dino_obs_f)[0].unsqueeze(1).detach().cpu().numpy()
+                z_pred_w = self.e2c_wrist.enc(dino_obs_w)[0].unsqueeze(1).detach().cpu().numpy()
+                
+                min_dist_f = np.ones(len(next_obs)) * 10000
+                min_dist_w = np.ones(len(next_obs)) * 10000
+                idx_f_best = np.zeros(len(next_obs))
+                idx_w_best = np.zeros(len(next_obs))
+                T_demos = np.zeros(len(next_obs))
+                
+                for i in range(len(replay_buffer.demo_starts)):
+                    z_demo_f = self.z_demo_front_cache[i]
+                    z_dist_f = ((z_demo_f - z_pred_f) ** 2).sum(axis=2)
+                    z_dist_min_f = z_dist_f.min(axis=1)
+                    update_min_f = z_dist_min_f < min_dist_f
+                    min_dist_f[update_min_f] = z_dist_min_f[update_min_f]
+                    idx_f_best[update_min_f] = z_dist_f.argmin(axis=1)[update_min_f]
+                    
+                    z_demo_w = self.z_demo_wrist_cache[i]
+                    z_dist_w = ((z_demo_w - z_pred_w) ** 2).sum(axis=2)
+                    z_dist_min_w = z_dist_w.min(axis=1)
+                    update_min_w = z_dist_min_w < min_dist_w
+                    min_dist_w[update_min_w] = z_dist_min_w[update_min_w]
+                    idx_w_best[update_min_w] = z_dist_w.argmin(axis=1)[update_min_w]
+                    
+                    updated_any = update_min_f | update_min_w
+                    T_demos[updated_any] = z_dist_f.shape[1]
+                
+                mask_f = (min_dist_f < self.ref_one_step_dist_front) & not_done.detach().cpu().numpy().flatten()
+                mask_w = (min_dist_w < self.ref_one_step_dist_wrist) & not_done.detach().cpu().numpy().flatten()
+                
+                prog_f = idx_f_best / np.maximum(T_demos, 1)
+                prog_w = idx_w_best / np.maximum(T_demos, 1)
+                
+                final_reward_mask = np.zeros_like(mask_f, dtype=bool)
+                final_discount_power = np.zeros_like(mask_f)
+                
+                # (1, 1)
+                idx_11 = mask_f & mask_w
+                final_reward_mask[idx_11] = True
+                min_prog = np.minimum(prog_f[idx_11], prog_w[idx_11])
+                final_discount_power[idx_11] = T_demos[idx_11] * (1 - min_prog)
+                
+                # (0, 1)
+                idx_01 = (~mask_f) & mask_w
+                final_reward_mask[idx_01] = True
+                final_discount_power[idx_01] = T_demos[idx_01] * (1 - prog_w[idx_01])
+                
+                demo_reward_discount = 0.98
+                additional_reward = (
+                    np.power(demo_reward_discount, final_discount_power)
+                    * final_reward_mask
+                    * self.p_reward
+                )
+                
+                if step % self.log_interval == 0:
+                    num_valid = final_reward_mask.astype(int).sum()
+                    if num_valid > 0:
+                        L.log("train/avg_discount", (final_discount_power * final_reward_mask).sum() / num_valid, step)
+                    L.log("train/num_additional_reward", num_valid, step)
+                    L.log("train/num_11_reward", idx_11.astype(int).sum(), step)
+                    L.log("train/num_01_reward", idx_01.astype(int).sum(), step)
 
-            min_dist = np.ones(len(next_obs)) * 10000
-            discount_power = np.zeros(len(next_obs))
-            for i in range(len(replay_buffer.demo_starts)):
-                i_start = replay_buffer.demo_starts[i]
-                i_end = replay_buffer.demo_ends[i]
-                z_demo = self.z_demo_cache[i]
-                z_dist = ((z_demo - z_pred) ** 2).sum(axis=2)
-                z_dist_min = z_dist.min(axis=1)
-                update_min = z_dist_min < min_dist
-                min_dist[update_min] = z_dist_min[update_min]
-                discount_power[update_min] = (
-                    z_dist.shape[1] - z_dist.argmin(axis=1)[update_min]
-                )
+            else:
+                z_pred = self.e2c.enc(dino_next_obs)[0].unsqueeze(1).detach().cpu().numpy()
 
-            demo_reward_discount = 0.98
-            reward_mask = np.logical_and(
-                min_dist < self.ref_one_step_dist,
-                not_done.detach().cpu().numpy().flatten(),
-            )
-            additional_reward = (
-                np.power(demo_reward_discount, discount_power)
-                * reward_mask
-                * self.p_reward
-            )
-            if step % self.log_interval == 0:
-                L.log(
-                    "train/avg_discount",
-                    (discount_power * reward_mask).sum()
-                    / reward_mask.astype(int).sum(),
-                    step,
+                min_dist = np.ones(len(next_obs)) * 10000
+                discount_power = np.zeros(len(next_obs))
+                for i in range(len(replay_buffer.demo_starts)):
+                    i_start = replay_buffer.demo_starts[i]
+                    i_end = replay_buffer.demo_ends[i]
+                    z_demo = self.z_demo_cache[i]
+                    z_dist = ((z_demo - z_pred) ** 2).sum(axis=2)
+                    z_dist_min = z_dist.min(axis=1)
+                    update_min = z_dist_min < min_dist
+                    min_dist[update_min] = z_dist_min[update_min]
+                    discount_power[update_min] = (
+                        z_dist.shape[1] - z_dist.argmin(axis=1)[update_min]
+                    )
+
+                demo_reward_discount = 0.98
+                reward_mask = np.logical_and(
+                    min_dist < self.ref_one_step_dist,
+                    not_done.detach().cpu().numpy().flatten(),
                 )
-                L.log(
-                    "train/num_additional_reward",
-                    (min_dist < self.ref_one_step_dist).sum(),
-                    step,
+                additional_reward = (
+                    np.power(demo_reward_discount, discount_power)
+                    * reward_mask
+                    * self.p_reward
                 )
+                if step % self.log_interval == 0:
+                    L.log(
+                        "train/avg_discount",
+                        (discount_power * reward_mask).sum()
+                        / max(reward_mask.astype(int).sum(), 1),
+                        step,
+                    )
+                    L.log(
+                        "train/num_additional_reward",
+                        (min_dist < self.ref_one_step_dist).sum(),
+                        step,
+                    )
 
             reward += torch.as_tensor(
                 additional_reward, device=reward.device
             ).unsqueeze(1)
 
         self.update_sac(L, step, obs, action, reward, next_obs, not_done)
-
 
 class DINOOnlySacAgent(RadSacAgent):
     def dino_embed(self, obs):

@@ -96,7 +96,7 @@ def parse_args():
     parser.add_argument("--pretrain_mode", default=None, type=str)
     parser.add_argument("--conv_layer_norm", default=False, action="store_true")
     parser.add_argument("--p_reward", default=1, type=float)
-    parser.add_argument("--reward_camera", default="both", type=str, choices=["both", "wrist"])
+    parser.add_argument("--reward_camera", default="both", type=str, choices=["both", "wrist", "decouple"])
 
     args = parser.parse_args()
     return args
